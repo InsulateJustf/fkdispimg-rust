@@ -137,7 +137,6 @@ impl eframe::App for FkDispApp {
                 });
 
                 egui::ScrollArea::vertical()
-                    .id_salt("file_list_scroll")
                     .max_height(100.0)
                     .min_scrolled_height(100.0)
                     .show(ui, |ui| {
@@ -201,7 +200,7 @@ impl eframe::App for FkDispApp {
 
             ui.add_space(8.0);
 
-            // 下部：日志区域 - 使用 allocate_remaining 明确分配日志区域的高度
+            // 下部：日志区域 - 使用 group 包裹，让 ScrollArea 填充剩余空间
             ui.group(|ui| {
                 ui.strong("转换日志");
                 ui.separator();
@@ -211,7 +210,6 @@ impl eframe::App for FkDispApp {
                 
                 // 关键：stick_to_bottom(true) 会在有新内容时自动滚动到底部
                 egui::ScrollArea::vertical()
-                    .id_salt("log_scroll")
                     .max_height(log_height)
                     .stick_to_bottom(true)
                     .show(ui, |ui| {

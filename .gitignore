@@ -2,3 +2,11 @@
 *.bak
 .DS_Store
 *.xlsx
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+temp_wps_images/
+*.egg-info/
+*.xls
