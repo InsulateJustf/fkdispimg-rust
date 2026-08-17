@@ -1,0 +1,122 @@
+name: Build Rust FK_DISPIMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g., v1.0.0)'
+        required: false
+        default: ''
+      create_release:
+        description: 'Create GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact_name: fkdisp-macos
+          - os: windows-latest
+            artifact_name: fkdisp-windows.exe
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Build release
+      run: cargo build --release
+
+    - name: Rename artifact (Unix)
+      if: runner.os != 'Windows'
+      run: cp target/release/fkdisp ${{ matrix.artifact_name }}
+
+    - name: Rename artifact (Windows)
+      if: runner.os == 'Windows'
+      run: cp target/release/fkdisp.exe ${{ matrix.artifact_name }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: ${{ matrix.artifact_name }}
+        if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    if: inputs.create_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Get tag
+      id: get-tag
+      run: |
+        if [ -n "${{ inputs.release_tag }}" ]; then
+          echo "tag=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+        else
+          echo "tag=v$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Prepare release files
+      run: |
+        mkdir -p release
+        cp artifacts/fkdisp-macos/fkdisp-macos release/
+        cp artifacts/fkdisp-windows.exe/fkdisp-windows.exe release/
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.get-tag.outputs.tag }}
+        name: FK_DISPIMG Rust ${{ steps.get-tag.outputs.tag }}
+        body: |
+          ## FK_DISPIMG Rust 版本
+          
+          ### 下载
+          - **macOS**: `fkdisp-macos`
+          - **Windows**: `fkdisp-windows.exe`
+          
+          ### 使用方法
+          ```bash
+          # GUI 模式
+          ./fkdisp
+          
+          # 命令行模式
+          ./fkdisp 文件.xlsx
+          ./fkdisp *.xlsx
+          ```
+        files: |
+          release/fkdisp-macos
+          release/fkdisp-windows.exe
+        draft: false
+        prerelease: false
