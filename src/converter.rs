@@ -481,6 +481,28 @@ pub fn wps_image_converter(
         modified.insert(ct_path.to_string(), ct_xml.as_bytes().to_vec());
     }
 
+    // Excel 4/XLM macro functions can make a macro-free .xlsx trigger Excel's
+    // macro warning. WPS may preserve these as workbook defined names even
+    // after the original .xls source is gone.
+    if all_names.contains(&"xl/workbook.xml".to_string()) {
+        let mut workbook_xml = String::new();
+        archive
+            .by_name("xl/workbook.xml")?
+            .read_to_string(&mut workbook_xml)?;
+
+        let (sanitized_workbook, removed_names) = sanitize_legacy_macro_defined_names(&workbook_xml);
+        if !removed_names.is_empty() {
+            log_callback(&format!("\n检测到 {} 个 XLM 宏定义名称，正在清除:", removed_names.len()));
+            for name in &removed_names {
+                log_callback(&format!("  > {}", name));
+            }
+            modified.insert(
+                "xl/workbook.xml".to_string(),
+                sanitized_workbook.into_bytes(),
+            );
+        }
+    }
+
     // 写入输出文件
     log_callback(&format!("\n正在保存到: {} ...", output_xlsx.display()));
 
@@ -526,4 +548,66 @@ struct SheetDrawingInfo {
     drawing: String,
     drawing_rels: String,
     sheet_rels: String,
+}
+
+fn legacy_macro_defined_name_value_contains(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    ["EVALUATE(", "CALL(", "REGISTER(", "REGISTER.ID("]
+        .iter()
+        .any(|function| upper.contains(function))
+}
+
+fn find_legacy_macro_defined_names(workbook_xml: &str) -> Vec<String> {
+    let entry_re = Regex::new(r#"(?s)<definedName\b[^>]*>(.*?)</definedName>"#).unwrap();
+    let name_re = Regex::new(r#"name="([^"]+)""#).unwrap();
+
+    entry_re
+        .captures_iter(workbook_xml)
+        .filter(|captures| legacy_macro_defined_name_value_contains(&captures[1]))
+        .filter_map(|captures| {
+            name_re
+                .captures(&captures[0])
+                .and_then(|name| name.get(1))
+                .map(|name| name.as_str().to_string())
+        })
+        .collect()
+}
+
+fn sanitize_legacy_macro_defined_names(workbook_xml: &str) -> (String, Vec<String>) {
+    let removed = find_legacy_macro_defined_names(workbook_xml);
+    if removed.is_empty() {
+        return (workbook_xml.to_string(), removed);
+    }
+
+    let entry_re = Regex::new(r#"(?s)<definedName\b[^>]*>(.*?)</definedName>"#).unwrap();
+    let sanitized = entry_re.replace_all(workbook_xml, |captures: &regex::Captures| {
+        if legacy_macro_defined_name_value_contains(&captures[1]) {
+            String::new()
+        } else {
+            captures[0].to_string()
+        }
+    });
+
+    (sanitized.into_owned(), removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_removes_only_legacy_macro_defined_names() {
+        let xml = r#"<workbook><definedNames>
+<definedName name="_xlnm.Print_Area" localSheetId="0">Sheet!$A$1:$A$2</definedName>
+<definedName name="_macro_lookup">EVALUATE([1]Calc!$E$4:$E$466)</definedName>
+</definedNames></workbook>"#;
+
+        let (sanitized, removed) = sanitize_legacy_macro_defined_names(xml);
+
+        assert_eq!(removed, vec!["_macro_lookup".to_string()]);
+        assert!(sanitized.contains("_xlnm.Print_Area"));
+        assert!(sanitized.contains("Sheet!$A$1:$A$2"));
+        assert!(!sanitized.contains("EVALUATE"));
+        assert!(!sanitized.contains("_macro_lookup"));
+    }
 }
