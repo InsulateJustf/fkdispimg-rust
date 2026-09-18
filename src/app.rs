@@ -18,7 +18,6 @@ pub struct FkDispApp {
     files: Vec<PathBuf>,
     state: ConversionState,
     log_messages: Arc<Mutex<Vec<String>>>,
-    scroll_to_bottom: Arc<Mutex<bool>>,
     drop_hover: bool,
 }
 
@@ -28,7 +27,6 @@ impl FkDispApp {
             files: Vec::new(),
             state: ConversionState::Idle,
             log_messages: Arc::new(Mutex::new(Vec::new())),
-            scroll_to_bottom: Arc::new(Mutex::new(false)),
             drop_hover: false,
         }
     }
@@ -58,7 +56,6 @@ impl FkDispApp {
 
         let files = self.files.clone();
         let log_messages = self.log_messages.clone();
-        let scroll_to_bottom = self.scroll_to_bottom.clone();
         let ctx = ctx.clone();
 
         thread::spawn(move || {
@@ -68,18 +65,18 @@ impl FkDispApp {
 
             for (i, input) in files.iter().enumerate() {
                 let output = utils::generate_output_path(input);
-                log_msg(&log_messages, &scroll_to_bottom, &format!("[{}/{}] {}", i + 1, total, input.file_name().unwrap_or_default().to_string_lossy()));
-                match converter::wps_image_converter(input, &output, |msg| { log_msg(&log_messages, &scroll_to_bottom, msg); }) {
+                log_msg(&log_messages, &format!("[{}/{}] {}", i + 1, total, input.file_name().unwrap_or_default().to_string_lossy()));
+                match converter::wps_image_converter(input, &output, |msg| { log_msg(&log_messages, msg); }) {
                     Ok((true, _, _)) => ok += 1,
-                    Ok((false, msg, _)) => { fail += 1; log_msg(&log_messages, &scroll_to_bottom, &format!("  ✗ {}", msg)); }
-                    Err(e) => { fail += 1; log_msg(&log_messages, &scroll_to_bottom, &format!("  ✗ {}", e)); }
+                    Ok((false, msg, _)) => { fail += 1; log_msg(&log_messages, &format!("  ✗ {}", msg)); }
+                    Err(e) => { fail += 1; log_msg(&log_messages, &format!("  ✗ {}", e)); }
                 }
                 ctx.request_repaint();
             }
 
-            log_msg(&log_messages, &scroll_to_bottom, &"-".repeat(30));
-            log_msg(&log_messages, &scroll_to_bottom, &format!("完成: 成功 {}，失败 {}，共 {}", ok, fail, total));
-            log_msg(&log_messages, &scroll_to_bottom, &format!("__DONE__{}|{}|{}", ok, fail, total));
+            log_msg(&log_messages, &"-".repeat(30));
+            log_msg(&log_messages, &format!("完成: 成功 {}，失败 {}，共 {}", ok, fail, total));
+            log_msg(&log_messages, &format!("__DONE__{}|{}|{}", ok, fail, total));
             ctx.request_repaint();
         });
     }
@@ -103,9 +100,8 @@ impl FkDispApp {
     }
 }
 
-fn log_msg(messages: &Arc<Mutex<Vec<String>>>, scroll_to_bottom: &Arc<Mutex<bool>>, msg: &str) {
+fn log_msg(messages: &Arc<Mutex<Vec<String>>>, msg: &str) {
     if let Ok(mut log) = messages.lock() { log.push(msg.to_string()); }
-    if let Ok(mut scroll) = scroll_to_bottom.lock() { *scroll = true; }
 }
 
 impl eframe::App for FkDispApp {
@@ -141,6 +137,7 @@ impl eframe::App for FkDispApp {
                 });
 
                 egui::ScrollArea::vertical()
+                    .id_salt("file_list_scroll")
                     .max_height(100.0)
                     .min_scrolled_height(100.0)
                     .show(ui, |ui| {
@@ -204,7 +201,7 @@ impl eframe::App for FkDispApp {
 
             ui.add_space(8.0);
 
-            // 下部：日志区域 - 使用 group 包裹，让 ScrollArea 填充剩余空间
+            // 下部：日志区域 - 使用 allocate_remaining 明确分配日志区域的高度
             ui.group(|ui| {
                 ui.strong("转换日志");
                 ui.separator();
@@ -213,34 +210,24 @@ impl eframe::App for FkDispApp {
                 let log_height = (ui.available_height() - 10.0).max(100.0);
                 
                 // 关键：stick_to_bottom(true) 会在有新内容时自动滚动到底部
-                let scroll_area = egui::ScrollArea::vertical()
+                egui::ScrollArea::vertical()
+                    .id_salt("log_scroll")
                     .max_height(log_height)
-                    .stick_to_bottom(true);
-                
-                scroll_area.show(ui, |ui| {
-                    if let Ok(log) = self.log_messages.lock() {
-                        let has_content = log.iter().any(|m| !m.starts_with("__DONE__"));
-                        if !has_content {
-                            ui.colored_label(egui::Color32::GRAY, "等待转换...");
-                        } else {
-                            for msg in log.iter() {
-                                if !msg.starts_with("__DONE__") {
-                                    ui.monospace(msg);
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if let Ok(log) = self.log_messages.lock() {
+                            let has_content = log.iter().any(|m| !m.starts_with("__DONE__"));
+                            if !has_content {
+                                ui.colored_label(egui::Color32::GRAY, "等待转换...");
+                            } else {
+                                for msg in log.iter() {
+                                    if !msg.starts_with("__DONE__") {
+                                        ui.monospace(msg);
+                                    }
                                 }
                             }
                         }
-                    }
-                    
-                    // 检查是否需要滚动到底部
-                    if let Ok(mut scroll) = self.scroll_to_bottom.lock() {
-                        if *scroll {
-                            // 在日志内容后添加一个不可见的锚点，并滚动到它
-                            ui.label("");
-                            ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-                            *scroll = false;
-                        }
-                    }
-                });
+                    });
             });
         });
     }

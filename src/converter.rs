@@ -139,64 +139,73 @@ fn find_rid_for_target(xml: &str, target: &str) -> Option<String> {
 
 /// 查找并清除 DISPIMG 函数，返回 (单元格信息, 新内容)
 fn find_and_clear_dispimg(content: &str, name_to_media: &HashMap<String, String>) -> (Vec<(String, String)>, String) {
+    let coord_re = Regex::new(r#"<c r="([A-Z]+\d+)""#).unwrap();
+    let img_re = Regex::new(r#"_xlfn\.DISPIMG\(&quot;([^&]+)&quot;"#).unwrap();
+    
     let mut result = Vec::new();
     let mut output = String::new();
-    let mut i = 0;
+    let mut last_end = 0;
 
-    while i < content.len() {
-        // 查找 <c 标签
-        if let Some(c_start) = content[i..].find("<c ") {
-            let c_start = i + c_start;
-            // 写入 <c 之前的内容
-            output.push_str(&content[i..c_start]);
+    // 预编译 DISPIMG 模式正则
+    let dispimg_re = Regex::new(r#"_xlfn\.DISPIMG\(&quot;([^&]+)&quot;"#).unwrap();
 
-            // 查找 </c> 结束标签
-            if let Some(c_end) = content[c_start..].find("</c>") {
-                let c_end = c_start + c_end + 4; // 包含 </c>
-                let cell_full = &content[c_start..c_end];
+    // 直接搜索每个 _xlfn.DISPIMG 出现位置，然后向上查找其所属 <c> 标签
+    for m in dispimg_re.find_iter(content) {
+        let disp_start = m.start();
 
-                // 检查是否包含 DISPIMG
-                if cell_full.contains("DISPIMG") {
-                    let coord_re = Regex::new(r#"<c r="([A-Z]+\d+)""#).unwrap();
-                    let img_re = Regex::new(r#"_xlfn\.DISPIMG\(&quot;([^&]+)&quot;"#).unwrap();
+        // 向前搜索最近的 <c 开始标签（使用 rfind 找到 DISPIMG 之前的最后一个 <c）
+        let before = &content[..disp_start];
+        let c_start = match before.rfind("<c ") {
+            Some(pos) => pos,
+            None => continue,
+        };
 
-                    if let (Some(coord_caps), Some(img_caps)) = (coord_re.captures(cell_full), img_re.captures(cell_full)) {
-                        let coord = coord_caps[1].to_string();
-                        let img_name = img_caps[1].to_string();
+        // 获取此 <c 标签的 coord
+        let from_c = &content[c_start..];
+        let coord_caps = match coord_re.captures(from_c) {
+            Some(caps) => caps,
+            None => continue,
+        };
+        let coord = coord_caps[1].to_string();
 
-                        if name_to_media.contains_key(&img_name) {
-                            result.push((coord.clone(), img_name));
+        // 获取图片名
+        let img_caps = match img_re.captures(from_c) {
+            Some(caps) => caps,
+            None => continue,
+        };
+        let img_name = img_caps[1].to_string();
 
-                            // 提取 <c r="XX" attrs> 的开头标签，转为自闭合
-                            if let Some(tag_end) = cell_full.find('>') {
-                                let open_tag = &cell_full[..tag_end];
-                                output.push_str(open_tag);
-                                output.push('/');
-                                output.push('>');
-                                i = c_end;
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // 非 DISPIMG 单元格，原样写入
-                output.push_str(cell_full);
-                i = c_end;
-            } else {
-                // 没有闭合标签
-                output.push_str(&content[c_start..]);
-                break;
-            }
-        } else {
-            output.push_str(&content[i..]);
-            break;
+        if !name_to_media.contains_key(&img_name) {
+            continue;
         }
+
+        // 查找此单元格的 </c> 结束标签
+        let c_end = match content[c_start..].find("</c>") {
+            Some(pos) => c_start + pos + 4,
+            None => continue,
+        };
+
+        result.push((coord, img_name));
+
+        // 输出 last_end 到此 <c 标签之间的内容（包括前面的空单元格）
+        output.push_str(&content[last_end..c_start]);
+
+        // 提取 <c r="XX" attrs> 的开头标签，转为自闭合
+        if let Some(tag_end) = from_c.find('>') {
+            let open_tag = &from_c[..tag_end];
+            output.push_str(open_tag);
+            output.push('/');
+            output.push('>');
+        }
+
+        last_end = c_end;
     }
+
+    // 输出剩余内容
+    output.push_str(&content[last_end..]);
 
     (result, output)
 }
-
 /// 安全地截取字符串到指定字节位置（确保在字符边界上）
 fn safe_slice(s: &str, end: usize) -> &str {
     if end >= s.len() {
@@ -381,10 +390,9 @@ pub fn wps_image_converter(
             );
             modified.insert(srp.clone(), sr.as_bytes().to_vec());
 
-            content = content.replace(
-                "</worksheet>",
-                &format!(r#"<drawing r:id="rId{}"/></worksheet>"#, sr_rid),
-            );
+            // 将 <drawing> 引用添加到 sheet XML
+            let drawing_ref = format!(r#"<drawing r:id="rId{}"/></worksheet>"#, sr_rid);
+            content = content.replace("</worksheet>", &drawing_ref);
 
             (dp, rp)
         };
@@ -440,7 +448,16 @@ pub fn wps_image_converter(
             }
         }
 
-        modified.insert(sheet_path, new_content.as_bytes().to_vec());
+        // 确保 sheet XML 包含 <drawing> 引用
+        let final_sheet = if content.contains("<drawing") && !new_content.contains("<drawing") {
+            let drawing_start = content.find("<drawing").unwrap();
+            let drawing_end = content[drawing_start..].find("/>").unwrap() + 2;
+            let drawing_tag = &content[drawing_start..drawing_start + drawing_end];
+            new_content.replace("</worksheet>", &format!("{}{}", drawing_tag, "</worksheet>"))
+        } else {
+            new_content.clone()
+        };
+        modified.insert(sheet_path, final_sheet.as_bytes().to_vec());
         modified.insert(dp, dx.as_bytes().to_vec());
         modified.insert(rp, dr.as_bytes().to_vec());
     }
@@ -462,6 +479,28 @@ pub fn wps_image_converter(
             }
         }
         modified.insert(ct_path.to_string(), ct_xml.as_bytes().to_vec());
+    }
+
+    // Excel 4/XLM macro functions can make a macro-free .xlsx trigger Excel's
+    // macro warning. WPS may preserve these as workbook defined names even
+    // after the original .xls source is gone.
+    if all_names.contains(&"xl/workbook.xml".to_string()) {
+        let mut workbook_xml = String::new();
+        archive
+            .by_name("xl/workbook.xml")?
+            .read_to_string(&mut workbook_xml)?;
+
+        let (sanitized_workbook, removed_names) = sanitize_legacy_macro_defined_names(&workbook_xml);
+        if !removed_names.is_empty() {
+            log_callback(&format!("\n检测到 {} 个 XLM 宏定义名称，正在清除:", removed_names.len()));
+            for name in &removed_names {
+                log_callback(&format!("  > {}", name));
+            }
+            modified.insert(
+                "xl/workbook.xml".to_string(),
+                sanitized_workbook.into_bytes(),
+            );
+        }
     }
 
     // 写入输出文件
@@ -509,4 +548,66 @@ struct SheetDrawingInfo {
     drawing: String,
     drawing_rels: String,
     sheet_rels: String,
+}
+
+fn legacy_macro_defined_name_value_contains(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    ["EVALUATE(", "CALL(", "REGISTER(", "REGISTER.ID("]
+        .iter()
+        .any(|function| upper.contains(function))
+}
+
+fn find_legacy_macro_defined_names(workbook_xml: &str) -> Vec<String> {
+    let entry_re = Regex::new(r#"(?s)<definedName\b[^>]*>(.*?)</definedName>"#).unwrap();
+    let name_re = Regex::new(r#"name="([^"]+)""#).unwrap();
+
+    entry_re
+        .captures_iter(workbook_xml)
+        .filter(|captures| legacy_macro_defined_name_value_contains(&captures[1]))
+        .filter_map(|captures| {
+            name_re
+                .captures(&captures[0])
+                .and_then(|name| name.get(1))
+                .map(|name| name.as_str().to_string())
+        })
+        .collect()
+}
+
+fn sanitize_legacy_macro_defined_names(workbook_xml: &str) -> (String, Vec<String>) {
+    let removed = find_legacy_macro_defined_names(workbook_xml);
+    if removed.is_empty() {
+        return (workbook_xml.to_string(), removed);
+    }
+
+    let entry_re = Regex::new(r#"(?s)<definedName\b[^>]*>(.*?)</definedName>"#).unwrap();
+    let sanitized = entry_re.replace_all(workbook_xml, |captures: &regex::Captures| {
+        if legacy_macro_defined_name_value_contains(&captures[1]) {
+            String::new()
+        } else {
+            captures[0].to_string()
+        }
+    });
+
+    (sanitized.into_owned(), removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_removes_only_legacy_macro_defined_names() {
+        let xml = r#"<workbook><definedNames>
+<definedName name="_xlnm.Print_Area" localSheetId="0">Sheet!$A$1:$A$2</definedName>
+<definedName name="_macro_lookup">EVALUATE([1]Calc!$E$4:$E$466)</definedName>
+</definedNames></workbook>"#;
+
+        let (sanitized, removed) = sanitize_legacy_macro_defined_names(xml);
+
+        assert_eq!(removed, vec!["_macro_lookup".to_string()]);
+        assert!(sanitized.contains("_xlnm.Print_Area"));
+        assert!(sanitized.contains("Sheet!$A$1:$A$2"));
+        assert!(!sanitized.contains("EVALUATE"));
+        assert!(!sanitized.contains("_macro_lookup"));
+    }
 }
