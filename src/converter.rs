@@ -149,6 +149,72 @@ fn find_and_clear_dispimg(content: &str, name_to_media: &HashMap<String, String>
     // 预编译 DISPIMG 模式正则
     let dispimg_re = Regex::new(r#"_xlfn\.DISPIMG\(&quot;([^&]+)&quot;"#).unwrap();
 
+    // 共享公式处理：WPS 常把相邻的 DISPIMG 公式合并为共享公式组
+    // （主单元格 <f t="shared" ref="H21:H23" si="4">，从属单元格
+    // <f t="shared" si="4"/>）。若只清除主单元格，从属单元格会变成
+    // 孤儿 si 引用，Excel 会提示文件损坏；修复后 Excel 恢复从属
+    // 单元格中的 =DISPIMG 缓存公式，表现为“部分公式未被转换”。
+    // 因此清除主单元格时必须一并清除其从属单元格。
+    let f_shared_re = Regex::new(r#"<f t="shared"[^>]*>"#).unwrap();
+    let si_re = Regex::new(r#"si="(\d+)""#).unwrap();
+    let mut si_groups: HashSet<String> = HashSet::new();
+    for m in dispimg_re.find_iter(content) {
+        let Some(c_start) = content[..m.start()].rfind("<c ") else {
+            continue;
+        };
+        let from_c = &content[c_start..];
+        let Some(img_caps) = img_re.captures(from_c) else {
+            continue;
+        };
+        if !name_to_media.contains_key(&img_caps[1]) {
+            continue;
+        }
+        let Some(c_end) = content[c_start..].find("</c>") else {
+            continue;
+        };
+        let cell = &content[c_start..c_start + c_end + 4];
+        let Some(f_tag) = f_shared_re.find(cell) else {
+            continue;
+        };
+        let tag = f_tag.as_str();
+        if !tag.contains("ref=") {
+            continue;
+        }
+        if let Some(si) = si_re.captures(tag) {
+            si_groups.insert(si[1].to_string());
+        }
+    }
+
+    let mut cleared = content.to_string();
+    if !si_groups.is_empty() {
+        // 从属单元格形如 <c r="H22" s="109" t="str"><f t="shared" si="4"/><v>...</v></c>
+        // 整体替换为自闭合 <c r="H22" s="109" t="str"/>。在闭包中检查
+        // <f> 标签不含 ref 且 si 属于被清除主单元格的组，避免误伤主单元格。
+        let slave_cell_re = Regex::new(&format!(
+            r#"(?s)(<c [^>]*>)(<f t="shared"[^>]*/>)(?:<v>.*?</v>)?</c>"#,
+        ))
+        .unwrap();
+        let si_in_group = |tag: &str| {
+            si_re
+                .captures(tag)
+                .map(|si| si_groups.contains(&si[1].to_string()))
+                .unwrap_or(false)
+        };
+        cleared = slave_cell_re
+            .replace_all(content, |caps: &regex::Captures| {
+                let f_tag = &caps[2];
+                if !f_tag.contains("ref=") && si_in_group(f_tag) {
+                    let open = &caps[1];
+                    format!("{}/>", &open[..open.len() - 1])
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .to_string();
+    }
+
+    let content: &str = &cleared;
+
     // 直接搜索每个 _xlfn.DISPIMG 出现位置，然后向上查找其所属 <c> 标签
     for m in dispimg_re.find_iter(content) {
         let disp_start = m.start();
@@ -594,6 +660,40 @@ fn sanitize_legacy_macro_defined_names(workbook_xml: &str) -> (String, Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clears_shared_formula_slaves_of_dispimg_master() {
+        // 清除共享公式主单元格（H21）时，其从属单元格（H22/H23 的
+        // <f t="shared" si="4"/>）必须一并清除，否则 Excel 报文件损坏。
+        let content = r#"<sheetData><c r="H21" s="109" t="str"><f t="shared" ref="H21:H23" si="4">_xlfn.DISPIMG(&quot;ID_A&quot;,1)</f><v>=DISPIMG(&quot;ID_A&quot;,1)</v></c><c r="I21" s="109" t="s"><v>32</v></c><c r="H22" s="109" t="str"><f t="shared" si="4"/><v>=DISPIMG(&quot;ID_A&quot;,1)</v></c><c r="H23" s="109" t="str"><f t="shared" si="4"/><v>=DISPIMG(&quot;ID_A&quot;,1)</v></c></sheetData>"#;
+        let mut name_to_media = HashMap::new();
+        name_to_media.insert("ID_A".to_string(), "media/image1.png".to_string());
+
+        let (cells, out) = find_and_clear_dispimg(content, &name_to_media);
+
+        assert_eq!(cells, vec![("H21".to_string(), "ID_A".to_string())]);
+        // H21 主单元格已清除
+        assert!(!out.contains("_xlfn.DISPIMG"));
+        // 无孤儿 si 引用，从属单元格已自闭合
+        assert!(!out.contains("si=\"4\""));
+        assert!(out.contains("<c r=\"H22\" s=\"109\" t=\"str\"/>"));
+        assert!(out.contains("<c r=\"H23\" s=\"109\" t=\"str\"/>"));
+        // 不相干的普通单元格保持原样
+        assert!(out.contains("<c r=\"I21\" s=\"109\" t=\"s\"><v>32</v></c>"));
+    }
+
+    #[test]
+    fn keeps_slaves_when_master_image_unknown() {
+        // 图片名不在映射中时主单元格不清除，从属单元格也必须保留
+        let content = r#"<sheetData><c r="H21" s="109" t="str"><f t="shared" ref="H21:H23" si="4">_xlfn.DISPIMG(&quot;ID_X&quot;,1)</f><v>=DISPIMG(&quot;ID_X&quot;,1)</v></c><c r="H22" s="109" t="str"><f t="shared" si="4"/><v>=DISPIMG(&quot;ID_X&quot;,1)</v></c></sheetData>"#;
+        let name_to_media: HashMap<String, String> = HashMap::new();
+
+        let (cells, out) = find_and_clear_dispimg(content, &name_to_media);
+
+        assert!(cells.is_empty());
+        assert!(out.contains("si=\"4\""));
+        assert!(out.contains("<c r=\"H22\" s=\"109\" t=\"str\"><f t=\"shared\" si=\"4\"/>"));
+    }
 
     #[test]
     fn sanitize_removes_only_legacy_macro_defined_names() {
